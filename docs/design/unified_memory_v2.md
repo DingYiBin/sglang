@@ -147,17 +147,25 @@ layer-minor）放置 canonical 行：先按类型分组（`Full → CA4 → CA12
 **公式**：
 
 ```
-block_bytes = Σ_L (P / ratio(L)) × row_bytes(L)
-total_bytes = num_blocks × block_bytes（+ 尾部 pad，供最末层 dense view 越界读）
-num_blocks  = ⌈max_total_tokens / P⌉
+block_payload_bytes = Σ_L (P / ratio(L)) × row_bytes(L)
+block_page_bytes    = align_up(block_payload_bytes, block_alignment)
+total_bytes         = num_blocks × block_page_bytes（+ 尾部 pad，供最末层 dense view 越界读）
+num_blocks          = ⌈max_total_tokens / P⌉
+
+itemsize = L.dtype.itemsize  # 当前 view 的 dtype 元素字节数；stride/storage_offset 的单位是元素而非字节
 
 view(L) = as_strided(
     raw.view(L.dtype),
     size           = (num_blocks, P/ratio(L), *L.row_shape),
-    stride         = (block_bytes/itemsize, row_bytes(L)/itemsize, *row_strides),
+    stride         = (block_page_bytes/itemsize, row_bytes(L)/itemsize, *row_strides),
     storage_offset = cum_offset(L) / itemsize,     # 按类型→层序累积（同类型层连续，跨类型偏移）
 )
 ```
+
+`block_alignment` 覆盖块内各 dtype / kernel 的对齐要求；各类型起始 offset 也分别按其 dtype
+对齐。由于 C4/C128 等压缩行只按 ratio 占据部分源 token，`block_page_bytes / P` **不保证为整数，
+也不需要有"每 token 字节数"的物理含义**。Region A 的分配和 compaction 单位是整个
+`block_page_bytes`，不是 `P × entry_bytes_per_token`。
 
 **token → 槽映射**：
 
@@ -393,16 +401,33 @@ checkpoint 自动落在同一节点，**无需额外"区域间索引表"**；锁
 - **compute ring**：逐请求，请求结束随 req 释放，不进树、不参与 eviction。
 - decode 期间只需锁 compute 覆盖的尾部窗口（`release_window_lock`，`swa_component.py:686`）。
 
-### 7.4 分配器（复用当前 v2p 映射）与尺寸
+### 7.4 分配器（复用 v2p 算法，重构为 page/block-native）与尺寸
 
 V2 = **Region A（页粒度）+ Region B（slot 粒度）**，正好对应当前 **2-ended MultiEndedAllocator**
-模型（一个 grow-up、一个 grow-down，共享一块缓冲）：
+模型（一个 grow-up、一个 grow-down，共享一块缓冲）。V2 保留双端增长、虚拟页 ID、v2p/p2v、
+free、compaction 和 in-flight 保护，但需要把 allocator 的字节模型从
+`entry_bytes_per_page = entry_bytes_per_token × page_size` 改为由 sub-pool **直接给出**
+`tokens_per_page` 与 `page_bytes`：
 
-- **Region A**：`page_size=P` 的 sub-pool，用现有 `MultiEndedAllocator` 虚拟→物理页表；
-- **Region B**：`page_size=1` 的 sub-pool，用现有 `UnifiedMambaSlotAllocator`（`multi_ended_allocator.py:856`）。
+```
+SubPoolSpec:
+    tokens_per_page  # 逻辑上一个物理页覆盖多少源 token
+    page_bytes       # 一个物理页/block 的实际字节跨度
+
+num_physical_pages = floor(pool_byte_capacity / page_bytes)
+num_virtual_tokens = num_physical_pages × tokens_per_page
+```
+
+- **Region A**：`tokens_per_page=P`、`page_bytes=block_page_bytes`；v2p 映射 block，watermark、
+  available size、zero/move/compaction 全部按 `page_bytes` 计。压缩场景下
+  `page_bytes/P` 可以不是整数。
+- **Region B**：`tokens_per_page=1`、`page_bytes=checkpoint_entry_bytes`，继续复用
+  `UnifiedMambaSlotAllocator` 的 slot 分配模式（类位于 `unified_memory_pool.py:856`）。
 
 `UnifiedKVPool` 的 `len(sub_pool_specs)==2` 断言（`unified_memory_pool.py:233`）对 V2 **恰好满足**
-（A + B 两个区域），映射机制不用改；只有未来要拆更细子池（如 Region A 内各类型独立 allocator）才需放宽。
+（A + B 两个区域）；不需要放宽为 N-ended，但 `SubPoolSpec`、`UnifiedKVPool.max_slots` 和
+`MultiEndedAllocator.entry_bytes_per_page` 的容量/地址计算需要 page-native 重构。只有未来要拆
+更细子池（如 Region A 内各类型独立 allocator）才需放宽 2 子池。
 
 **尺寸（复用当前 unified 公式）**：当前 `init_unified_mamba_pools`（`unified_memory_pool.py:1163`）：
 
@@ -416,8 +441,10 @@ total_bytes = max_total_num_tokens × full_entry_bytes
 两个 sub-pool 在 2-ended allocator 里**动态共享**（不是硬分区）。V2 对应地：
 
 ```
-total_bytes = RegionA_token_budget × block_entry_bytes
+total_bytes = RegionA_block_budget × block_page_bytes
             + RegionB_checkpoint_budget × checkpoint_entry_bytes
+
+RegionA_block_budget = ⌈RegionA_token_budget / P⌉
 ```
 
 Region B 预算 = `⌈N/CI⌉ × 每 checkpoint 字节`（每 checkpoint = §4.2 的 type-major 布局）。
@@ -457,7 +484,9 @@ Region B 预算 = `⌈N/CI⌉ × 每 checkpoint 字节`（每 checkpoint = §4.2
 
 ## 8. 迁移路径（分阶段）
 
-1. **Phase 0**：引入类型体系。`SubPoolSpec` 增加 `is_req_based` 标记；文档落库。
+1. **Phase 0**：引入类型体系，并把 allocator 重构为 page/block-native：
+   `SubPoolSpec` 增加 `is_req_based`、`tokens_per_page`、`page_bytes`；保持 v2p/p2v 与
+   2-ended 算法不变，容量、watermark、move/compaction 改为直接按 `page_bytes` 计算；文档落库。
 2. **Phase 1（DSV4 打通）**：把 DSV4 SWA ring + 压缩态接入双副本：canonical 进 Region A/B，
    compute ring 独立。→ 解除 DSV4 排除，证明 unified + DSV4。
 3. **Phase 2（mamba 重构）**：mamba conv/temporal 拆成 canonical + compute ring，保留 V1 行为为兼容模式。
