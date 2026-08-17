@@ -256,16 +256,28 @@ size(类型, 层):
 每 checkpoint = `Σ_C4层 ring_size(8)×row + Σ_C128层 ring_size(128)×row + (模式 a) Σ_SWA层 128×row`；
 Region B 容量 = `⌈N/CI⌉` × 每 checkpoint 大小。
 
-**前缀匹配集成**：radix tree 在 **checkpoint 边界**可分支。命中到位置 p 时：
+**前缀匹配集成**：token-type 与 req-type 分别返回匹配长度：
 
 ```
-p_i = floor(p / CI) * CI                 # 最近（≤p）的 checkpoint
-从 Region B 取 checkpoint p_i 恢复状态
-重灌 gap (p_i, p]，长度 ≤ CI
+L_token = Region A 最长 page-aligned 命中长度
+L_req   = Region B 各 req component 共同认可的可恢复长度
+
+0 <= L_req <= L_token
 ```
 
-- 模式 a：窗口 `[p_i-W+1, p_i]` 从 checkpoint 恢复，只重灌 `(p_i, p]`。
-- 模式 b：整个窗口 `[p-W+1, p]` 都重算（`swa_reprefill_tail_tokens`）。
+`L_req` 是 `L_token` 以内最新的**实际驻留且通过所有 req component validator** 的 checkpoint，
+不是简单的 `floor(L_token/CI)·CI`：Region B 可以独立淘汰，因此最近的 checkpoint 缺失时，
+`L_req` 可回退多个 CI，甚至回到 0。由 §7.3 的级联规则保证 Region B 不会比其依赖的
+Region A 活得更久，所以只会出现 `L_token >= L_req`。
+
+命中后统一重算 `[L_req, L_token)` 以推进 req compute state；这段 token-type canonical 已命中，
+因此只计算、不重新存储（selective-store replay，见 §7.2）。两种模式的差别只在 `L_req` 的
+validator 与恢复内容：
+
+- 模式 a：checkpoint 同时恢复 req state 与边界处的 SWA 窗口快照，再 replay 到 `L_token`。
+- 模式 b：不存 SWA snapshot；SWA validator 将 `L_req` 回退到可通过正向 replay 重建完整窗口的
+  可执行锚点，然后与其它 req state 共用同一条 selective-store replay 路径，不再单设
+  `swa_reprefill_tail_tokens` 流程。
 
 **恢复来源**（修正）：C4/C128 压缩态、conv、linear-attn 的状态是**隐状态累积 / 有损压缩的中间态**，
 Region A 只有压缩产物、没有逐 token 原始数据 → **无法从 Region A 恢复，必须靠 Region B checkpoint**。
@@ -361,12 +373,42 @@ CI_min = ceil((max_swa + 1) / page_size) × page_size     # DSV4: ceil(129/256)�
 ### 7.2 命中重建流程
 
 ```
-prefix hit（radix match 返回 canonical slot + best_match_node）
-  → scheduler 分配 compute ring slot
-  → 若 compute ring 已有与命中重叠的窗口：仅重灌缺失尾部
-      （等价 free_swa_out_of_window_slots + swa_evicted_seqlen 推进）
-  → 否则：canonical → compute D2D 拷贝（只读状态可 COW），继续 forward
+prefix hit
+  → radix/component validators 返回 L_token、L_req 与 Region B checkpoint slot
+  → scheduler 分配 compute ring，checkpoint → compute（D2D / 反量化 / COW）
+  → 构造一次 extend：
+      [L_req, L_token)      selective-store replay：计算 hidden、更新 req state，不写 Region A
+      [L_token, input_end)  normal prefill：计算并写入新分配的 Region A page
 ```
+
+**两个起点必须解耦**：
+
+```
+compute_start  = L_req
+kv_alloc_start = L_token
+```
+
+allocator 只为 `[L_token, input_end)` 分配新的 Region A page；`[L_req, L_token)` 的 page table /
+`req_to_token` 继续引用已命中的 Region A slot，不能因为参与 replay 而重复分配。
+
+**attention metadata 的 selective-store 语义**：同一个 extend batch 中，token-type store loc
+按位置构造：
+
+```
+token_store_loc[L_req:L_token]     = INVALID   # 通常 lower 为 slot_mapping=-1
+token_store_loc[L_token:input_end] = newly_allocated_slots
+req_state_store_loc[...]           = compute_ring_slots
+```
+
+因此 replay 仍执行各层 attention / MLP / MoE，产生推进 conv、linear-attn、C4/C128
+compress-state 所需的 hidden state，但 Full KV、C4/C128 压缩 KV、indexer 等 token-type
+canonical store 被跳过。
+
+`INVALID` 是 metadata 层语义，不把 `-1` 固定成跨 backend ABI：支持负 slot mask 的 kernel
+直接使用 `-1`；会把负 loc 翻译到 0 或不支持 mask 的 kernel 使用 reserved sink slot / 独立
+store mask / 跳过 store kernel。所有 attention backend 及 DSV4 compressor/indexer store
+都需审计；若 backend 的当前 token attention 依赖“先写 cache 再读”，还需改为使用当前 chunk
+的 raw K/V 或读取已有 canonical slot。
 
 ### 7.3 双区域关联与淘汰规则
 
@@ -385,6 +427,10 @@ checkpoint 自动落在同一节点，**无需额外"区域间索引表"**；锁
    - 早期 checkpoint 只服务于"短前缀命中"（重灌便宜），因此**先删早期（低 k）的**，
      保住晚期 checkpoint（长前缀复用能力），提高命中率；
    - 独立于 Region A：删 Region B 不删 Region A（该前缀降级为模式 b 重算）。
+
+由此得到命中不变量：`Region B checkpoint 存在 ⇒ 对应 Region A 前缀仍存在`，所以
+`L_req <= L_token`。Region B 独立释放只会扩大 selective-store replay 区间；Region A
+释放会级联删除其后的 Region B，不会产生 req-type 匹配比 token-type 更长的状态。
 
 **与现状 sglang 的对照**：
 
@@ -508,9 +554,10 @@ Region B 预算 = `⌈N/CI⌉ × 每 checkpoint 字节`（每 checkpoint = §4.2
 8. **混合模型的新算子**：type-major 只保证"同一类型层连续"。若 **Full 类型内 MLA 与 MHA/GQA 混合**，
    MLA 层仍不连续，dense 系 MLA 算子（trtllm/cutlass/flashmla）无法消费 → 需要把 Full 拆成
    Full-MLA / Full-MHA 子类型，或**开发 strided-view MLA 算子**（见 §4.1 算子兼容性）。
-9. **Region B 恢复算子**：命中时把 checkpoint（SWA 窗口快照 / 压缩态 / conv / linear）物化进 compute ring，
-   需要统一的"checkpoint→ring"恢复算子（D2D 拷贝 / 反量化 / 重灌），目前只有 `swa_reprefill_tail_tokens`
-   这类 SWA 专用路径，无通用算子。
+9. **Region B 恢复与 selective-store backend 审计**：命中时需要统一的
+   `checkpoint→compute ring` 恢复算子（D2D / 反量化 / COW），并要求 attention metadata
+   对 `[L_req,L_token)` 构造 INVALID token store loc。普通 attention、DSV4 compressor/indexer、
+   CUDA graph、PP/PD 路径需分别验证 INVALID 是真正 mask、sink write 还是需要跳过 store kernel。
 
 ## 10. 术语表
 
