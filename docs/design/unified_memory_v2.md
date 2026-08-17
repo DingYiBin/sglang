@@ -217,12 +217,16 @@ CI > max_swa_sliding_size    # 见下
 1. 每个 checkpoint 边界都能装下一个**完整**的 SWA 窗口（窗口不跨越两个 checkpoint）；
 2. 相邻 checkpoint 的窗口快照**不重叠** → Region B 的 SWA 内存 ≈ O(N)（每 token 只存一次），不随 W 膨胀。
 
-**布局**：Region B 按 **checkpoint 索引** `k = p / CI` 组织（内容寻址、跨请求共享、随 radix LRU 淘汰）。
-每个 checkpoint slot 存该边界处**该模型拥有的** req-based canonical，**内部按"类型 → 层"两级排序拼接**
+**布局**：`k = p / CI` 只是某条 radix 路径上的 checkpoint ordinal，用于判断边界、深度与策略，
+**不是 Region B 的全局 slot id**。同一深度的不同前缀拥有不同状态，其内容 identity 是对应的
+radix node；每个节点通过 allocator 获得任意稳定 virtual slot，slot 内存该边界处
+**该模型拥有的** req-based canonical，内部按"类型 → 层"两级排序拼接
 （type-major、layer-minor，与 Region A 块的纯层序不同）：
 
 ```
-checkpoint k（位置 p = k·CI） 字节 = Σ_类型 Σ_{层∈类型} size(类型, 层)
+radix node at checkpoint k（位置 p = k·CI）:
+  virtual_slot = RegionBAllocator.alloc(1)
+  checkpoint_bytes = Σ_类型 Σ_{层∈类型} size(类型, 层)
 ┌──────────────────────────────────────────────┐
 │ 类型 SWA（模式 a 才存）:                         │
 │   SWA.L0 窗口快照 [p-W+1, p]                  │
@@ -286,7 +290,10 @@ Region A 只有压缩产物、没有逐 token 原始数据 → **无法从 Regio
 ### 4.3 寻址与分配
 
 - **Region A**：沿用 `MultiEndedAllocator` 虚拟→物理页表，`page_size` 决定 radix 页与块大小。
-- **Region B**：按 checkpoint 索引 `k = p/CI` 寻址，slot 粒度，v2p 直接映射（`UnifiedMambaSlotAllocator` 已是这个模式）。
+- **Region B**：slot 粒度，由 checkpoint radix node 持有 allocator 返回的 virtual slot；
+  `k=p/CI` 只表示路径深度，不参与物理寻址。完整链路为
+  `radix node → virtual slot → v2p[virtual slot] → physical checkpoint bytes`
+  （`UnifiedMambaSlotAllocator` 已是这种任意 slot 分配/翻译模式）。
 - **compute ring**：独立于统一池，逐请求分配/释放（DSV4 SWA ring 现即如此）。
 
 ### 4.4 与 V1 的差异
@@ -417,13 +424,26 @@ store mask / 跳过 store kernel。所有 attention backend 及 DSV4 compressor/
 （如同现有 `MambaComponent.mamba_value`）。前缀同一性 = 节点同一性 → 同前缀的逐 token 缓存与
 checkpoint 自动落在同一节点，**无需额外"区域间索引表"**；锁也按节点关联（`inc/dec_lock_ref` 沿路径锁所有组件）。
 
+Region B 的 slot identity 与物理地址分离：
+
+```
+k = p / CI                                      # 路径上的逻辑 ordinal
+virtual_slot = RegionBAllocator.alloc(1)         # 全局唯一的稳定 handle
+node.component_data[REQ].value = virtual_slot
+physical_slot = RegionBAllocator.translate(virtual_slot)
+```
+
+不同 radix 分支即使 `p`、`k` 相同也分配不同 virtual slot。compaction 只更新 v2p，不改树节点保存的
+virtual slot。若一个压缩 radix edge 跨过 CI 边界，应在 page-aligned CI 边界拆 node，使 checkpoint、
+锁、LRU 与 tombstone 继续复用现有 node/component 生命周期；`CI % page_size == 0` 保证拆分合法。
+
 **淘汰规则（V2）**：
 
 1. **Region A（token-based）：从后往前释放，级联删 Region B**。
    - 走 LRU 叶子淘汰（叶子 = 最长前缀段，等价从尾部往回）；
    - 一段 Region A 被删 → 由它派生的 checkpoint（Region B）**必须一并释放**（结构保证：同一节点一删全删）。
 2. **Region B（req-based）：可独立释放，早期 checkpoint 优先**。
-   - 命中只消费 `⌊p/CI⌋` 那一个 checkpoint，**前面的 checkpoint 对本次命中无用**；
+   - 命中只消费 `L_token` 以内最新的实际驻留 checkpoint（`L_req`），**更早的 checkpoint 对本次命中无用**；
    - 早期 checkpoint 只服务于"短前缀命中"（重灌便宜），因此**先删早期（低 k）的**，
      保住晚期 checkpoint（长前缀复用能力），提高命中率；
    - 独立于 Region A：删 Region B 不删 Region A（该前缀降级为模式 b 重算）。
